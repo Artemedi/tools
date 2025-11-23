@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Steam RU/KZ Price Comparator & Converter (Fixed v3.3)
+// @name         Steam RU/KZ Price Comparator & Converter (v4.0 Stable)
 // @namespace    http://tampermonkey.net/
-// @version      3.3
-// @description  RU регион: запрашивает цену KZ, конвертирует в RUB и сравнивает. KZ регион: запрашивает цену RU в рублях.
+// @version      4.0
+// @description  RU регион: показывает цену KZ. KZ регион: показывает цену RU. Оптимизировано для Chrome.
 // @author       You
 // @match        https://store.steampowered.com/*
 // @grant        GM_xmlhttpRequest
@@ -17,12 +17,14 @@
     const RATE_API = "https://api.exchangerate-api.com/v4/latest/KZT";
     let kztToRub = 0;
     const priceCache = {};
+    let scanTimeout = null; // Для Debounce
 
     function log(msg) {
-        console.log(`[SteamPrice]: ${msg}`);
+        // Раскомментируй для отладки, по умолчанию выключено, чтобы не засорять консоль
+        // console.log(`[SteamPrice]: ${msg}`);
     }
 
-    // Инициализация: загрузка курса
+    // --- 1. Загрузка курса ---
     function init() {
         GM_xmlhttpRequest({
             method: "GET",
@@ -31,207 +33,195 @@
                 try {
                     const data = JSON.parse(res.responseText);
                     kztToRub = data.rates.RUB;
-                    log(`Курс загружен: 100 KZT = ${(kztToRub * 100).toFixed(2)} RUB`);
-                    runScan();
-                    startObserver();
-                } catch(e) { console.error("[SteamPrice] Ошибка парсинга курса:", e); }
-            },
-            onerror: err => console.error("[SteamPrice] Ошибка загрузки курса:", err)
-        });
-    }
-
-    /** Запрос цены в другом регионе (anonymous: true нужен для обхода кук) */
-    function getRegionalPrice(appId, regionCC, callback) {
-        const cacheKey = `${appId}_${regionCC}`;
-        if (priceCache[cacheKey] !== undefined) {
-            return callback(priceCache[cacheKey]);
-        }
-
-        GM_xmlhttpRequest({
-            method: "GET",
-            url: `https://store.steampowered.com/api/appdetails?appids=${appId}&cc=${regionCC}&filters=price_overview`,
-            anonymous: true,
-            onload: res => {
-                try {
-                    const json = JSON.parse(res.responseText);
-                    if (json[appId] && json[appId].success && json[appId].data.price_overview) {
-                        const price = json[appId].data.price_overview.final / 100;
-                        priceCache[cacheKey] = price;
-                        callback(price);
-                    } else {
-                        priceCache[cacheKey] = null;
-                        callback(null);
-                    }
-                } catch (e) {
-                    console.error(`[SteamPrice] Ошибка API Steam [${regionCC}]:`, e);
-                    callback(null);
-                }
+                    console.log(`[SteamPrice] Курс загружен: 100 KZT = ${(kztToRub * 100).toFixed(2)} RUB`);
+                    runScan(); // Первый прогон
+                    startObserver(); // Запуск слежения
+                } catch(e) { console.error("[SteamPrice] Ошибка курса:", e); }
             }
         });
     }
 
-    function processPriceElement(el) {
-        // Защита от повторной обработки
-        if (el.dataset.enhanced === "1" || !kztToRub) return;
+    // --- 2. API Запросы (Кэшированные) ---
+    function getRegionalPrice(appId, regionCC, callback) {
+        const cacheKey = `${appId}_${regionCC}`;
+        if (priceCache[cacheKey] !== undefined) return callback(priceCache[cacheKey]);
 
+        // Используем очередь или просто таймаут, чтобы не душить API, если запросов много
+        setTimeout(() => {
+            GM_xmlhttpRequest({
+                method: "GET",
+                url: `https://store.steampowered.com/api/appdetails?appids=${appId}&cc=${regionCC}&filters=price_overview`,
+                anonymous: true, // Скрываем куки (важно для RU региона)
+                onload: res => {
+                    try {
+                        const json = JSON.parse(res.responseText);
+                        if (json[appId] && json[appId].success && json[appId].data.price_overview) {
+                            const price = json[appId].data.price_overview.final / 100;
+                            priceCache[cacheKey] = price;
+                            callback(price);
+                        } else {
+                            priceCache[cacheKey] = null;
+                            callback(null);
+                        }
+                    } catch (e) {
+                        // Ошибки парсинга глушим, чтобы не спамить в консоль
+                        priceCache[cacheKey] = null;
+                        callback(null);
+                    }
+                },
+                onerror: () => callback(null)
+            });
+        }, 50); // Небольшая задержка запроса
+    }
+
+    // --- 3. Обработка ценника ---
+    function processPriceElement(el) {
+        if (el.dataset.steamPriceEnhanced === "1" || !kztToRub) return;
+
+        // Получаем чистый текст
         const rawText = el.innerText || "";
         const text = rawText.toLowerCase();
 
-        // Простая проверка валюты
+        // Проверка валюты
         const isKZ = text.includes("₸");
         const isRU = text.includes("руб") || text.includes("rub") || text.includes("₽") || text.includes("р.");
 
         if (!isKZ && !isRU) return;
 
-        // ПАРСИНГ ЦЕНЫ: Оставляем только цифры.
-        // Это самый надежный способ для Steam (там нет копеек в основном виде)
-        const digitsOnly = rawText.replace(/\D/g, "");
-        if (!digitsOnly) return;
+        // Извлекаем цифры (защита от "1 200")
+        const digits = rawText.replace(/\D/g, "");
+        if (!digits) return;
+        const currentPriceVal = parseInt(digits, 10);
         
-        let currentPriceVal = parseInt(digitsOnly, 10);
-        if (!currentPriceVal) return;
-
+        // Получаем AppID
         const appId = getAppId(el);
         if (!appId) return;
 
-        // Помечаем, что начали обработку
-        el.dataset.enhanced = "1";
+        // Помечаем элемент
+        el.dataset.steamPriceEnhanced = "1";
 
-        // === RU REGION ===
+        // ЛОГИКА RU
         if (isRU) {
             getRegionalPrice(appId, 'kz', (kzPriceInTenge) => {
-                // Если элемент исчез из DOM пока шел запрос (бывает при SPA переходах)
-                if (!el.isConnected) return;
+                if (!el.isConnected || !kzPriceInTenge) return;
 
-                if (!kzPriceInTenge) {
-                    log(`Цена KZ не найдена для ${appId}`);
-                    return;
-                }
-
-                // Логика расчета
                 let kzPriceInRub = Math.round(kzPriceInTenge * kztToRub);
-                let diff = 0;
-                let color = "#9ae2a8"; // Зеленый
-                let sign = "";
+                let diff = Math.round(((currentPriceVal - kzPriceInRub) / currentPriceVal) * 100);
+                
+                // Если KZ дешевле -> разница положительная (выгода), цвет зеленый
+                // Если KZ дороже -> разница отрицательная, цвет красный
+                let color = "#9ae2a8"; // Green
+                let diffStr = "";
 
                 if (currentPriceVal > kzPriceInRub) {
-                     // В KZ дешевле
+                     // В КЗ дешевле
                      diff = Math.round(((currentPriceVal - kzPriceInRub) / currentPriceVal) * 100);
-                     sign = "-";
+                     diffStr = `-${diff}%`;
                 } else {
-                     // В KZ дороже
+                     // В КЗ дороже
                      diff = Math.round(((kzPriceInRub - currentPriceVal) / currentPriceVal) * 100);
-                     color = "#e29a9a"; // Красный
-                     sign = "+";
+                     color = "#e29a9a"; // Red
+                     diffStr = `+${diff}%`;
                 }
 
-                const infoText = `🇰🇿 ${kzPriceInRub}₽ (${sign}${diff}%)`;
-                log(`[RU Logic] Текущая: ${currentPriceVal}, KZ(conv): ${kzPriceInRub}. Diff: ${diff}%`);
-                
-                appendInfo(el, infoText, color);
+                appendInfo(el, `🇰🇿 ${kzPriceInRub}₽ (${diffStr})`, color);
             });
         }
-
-        // === KZ REGION ===
+        // ЛОГИКА KZ
         else if (isKZ) {
             getRegionalPrice(appId, 'ru', (ruPriceInRub) => {
                 if (!el.isConnected) return;
 
                 let myTengeInRub = Math.round(currentPriceVal * kztToRub);
-                let infoText = `≈ ${myTengeInRub}₽`;
-                let color = "#9ae2a8";
+                let infoText = `≈${myTengeInRub}₽`;
+                let color = "#9ae2a8"; 
 
                 if (ruPriceInRub) {
                     let diff = 0;
                     if (myTengeInRub > ruPriceInRub) {
-                         // В РФ дешевле
-                         diff = Math.round(((myTengeInRub - ruPriceInRub) / myTengeInRub) * 100);
-                         infoText += ` | 🇷🇺 ${ruPriceInRub}₽ (-${diff}%)`;
-                         color = "#e29a9a"; 
+                        diff = Math.round(((myTengeInRub - ruPriceInRub) / myTengeInRub) * 100);
+                        infoText += ` | 🇷🇺 ${ruPriceInRub}₽ (-${diff}%)`;
+                        color = "#e29a9a"; // Красный, т.к. мы переплачиваем
                     } else {
-                         // В РФ дороже
-                         diff = Math.round(((ruPriceInRub - myTengeInRub) / myTengeInRub) * 100);
-                         infoText += ` | 🇷🇺 ${ruPriceInRub}₽ (+${diff}%)`;
+                        diff = Math.round(((ruPriceInRub - myTengeInRub) / myTengeInRub) * 100);
+                        infoText += ` | 🇷🇺 ${ruPriceInRub}₽ (+${diff}%)`;
                     }
                 } else {
                     infoText += " | 🇷🇺 n/a";
                 }
-                
                 appendInfo(el, infoText, color);
             });
         }
     }
 
+    // --- 4. Отрисовка ---
     function appendInfo(el, text, color) {
-        // Проверка на дубли
-        if (el.querySelector('.steam-price-comp')) return;
+        if (el.querySelector('.steam-price-comp-v4')) return;
 
-        // Создаем контейнер
-        const span = document.createElement("span");
-        span.className = "steam-price-comp";
-        
-        // Стилизация: display: block заставит перенестись на новую строку
-        // line-height нормализует высоту строки
-        span.style.cssText = `
-            display: block; 
-            color: ${color}; 
-            font-size: 11px; 
-            line-height: 1.2; 
-            margin-top: 2px; 
-            font-weight: bold;
-            font-family: Arial, sans-serif;
+        const container = document.createElement("div");
+        container.className = "steam-price-comp-v4";
+        // Используем !important чтобы перебить стили стима
+        container.style.cssText = `
+            display: block !important;
+            color: ${color} !important;
+            font-size: 11px !important;
+            line-height: 1.2 !important;
+            margin-top: 3px !important;
+            font-family: Arial, sans-serif !important;
+            font-weight: bold !important;
+            white-space: nowrap !important;
+            opacity: 0.9;
         `;
-        span.textContent = text;
+        container.textContent = text;
         
-        // Вставляем В КОНЕЦ элемента цены.
-        el.appendChild(span);
-        
-        // Если родитель имеет display: flex и align-items: center, текст может уехать.
-        // Добавляем принудительный перенос строки перед нашим спаном, если это не блочный элемент
-        if (window.getComputedStyle(el).display !== 'block') {
-             // span.style.display = "inline-block"; // или оставьте block
-             // Можно добавить <br> если совсем всё плохо с версткой
-        }
+        // Вставляем внутрь
+        el.appendChild(container);
     }
 
+    // --- 5. Поиск ID ---
     function getAppId(el) {
-        // 1. Из URL
+        // 1. Из URL страницы
         let m = location.href.match(/app\/(\d+)/);
         if (m) return m[1];
         
-        // 2. Попытка найти ID в кнопке (для списков желаемого и бандлов)
-        // Ищем ближайший input с name="subid" или форму добавления
-        const form = el.closest('form');
-        if (form) {
-             const action = form.getAttribute('action');
-             if (action) {
-                 // add_to_cart/12345
-                 let actM = action.match(/add_to_cart\/(\d+)/);
-                 if (actM) return actM[1]; // Это SubID, но для цен often works, хотя лучше AppID
-             }
+        // 2. Из кнопки покупки (для списков)
+        const btn = el.closest('form') || el.closest('.game_area_purchase_game');
+        if (btn) {
+            const action = btn.getAttribute('action');
+            if (action && action.includes('add_to_cart')) {
+                // Пытаемся вытянуть subid, но для грубой оценки пойдет, 
+                // хотя API стима требует appid. 
+                // Лучше вернем null, чтобы не делать ошибочных запросов на списках
+                return null; 
+            }
         }
-        return null;
+        return null; 
     }
 
+    // --- 6. Запуск сканирования (Debounced) ---
     function runScan() {
         const selectors = [
             ".game_purchase_price", 
             ".discount_final_price",
-            ".price" // Универсальный селектор
+            ".price"
         ];
-        document.querySelectorAll(selectors.join(", ")).forEach(processPriceElement);
+        const elements = document.querySelectorAll(selectors.join(", "));
+        elements.forEach(processPriceElement);
     }
 
     function startObserver() {
         const observer = new MutationObserver((mutations) => {
-            let shouldScan = false;
-            for (let m of mutations) {
-                if (m.addedNodes.length) { shouldScan = true; break; }
-            }
-            if (shouldScan) runScan();
+            // Если есть таймер - сбрасываем его
+            if (scanTimeout) clearTimeout(scanTimeout);
+            
+            // Ставим новый таймер на 500мс. 
+            // Это значит: "Запусти сканирование только если ничего не менялось полсекунды"
+            // Это спасет Chrome от зависания и ошибок.
+            scanTimeout = setTimeout(() => {
+                runScan();
+            }, 500);
         });
         
-        // Следим за всем body, так как цены могут быть где угодно
         observer.observe(document.body, { childList: true, subtree: true });
     }
 
