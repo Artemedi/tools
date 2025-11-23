@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Steam RU/KZ Price Comparator (Compatibility Mode v5.0)
+// @name         Steam RU/KZ Price Comparator (Text-Only Mode v6.0)
 // @namespace    http://tampermonkey.net/
-// @version      5.0
-// @description  Работает вместе с другими расширениями (SIH, Augmented Steam). Вставляет цены РЯДОМ, а не внутрь.
+// @version      6.0
+// @description  Сравнивает цены RU/KZ. Использует только текстовые узлы (без HTML тегов), чтобы работать вместе со Steam Inventory Helper в Chrome.
 // @author       You
 // @match        https://store.steampowered.com/*
 // @grant        GM_xmlhttpRequest
@@ -29,23 +29,22 @@
                     const data = JSON.parse(res.responseText);
                     kztToRub = data.rates.RUB;
                     console.log(`[SteamPrice] Курс: 100 KZT = ${(kztToRub * 100).toFixed(2)} RUB`);
-                    
-                    // Задержка первого запуска, чтобы дать прогрузиться другим расширениям (SIH и т.д.)
+                    // Даем браузеру и другим расширениям прогрузиться
                     setTimeout(() => {
                         runScan();
                         startObserver();
-                    }, 1500); 
+                    }, 1000);
                 } catch(e) { console.error("[SteamPrice] Ошибка курса:", e); }
             }
         });
     }
 
-    // --- 2. API Запрос ---
+    // --- 2. API Запрос (anonymous: true важно для RU региона) ---
     function getRegionalPrice(appId, regionCC, callback) {
         const cacheKey = `${appId}_${regionCC}`;
         if (priceCache[cacheKey] !== undefined) return callback(priceCache[cacheKey]);
 
-        // Небольшая очередь запросов
+        // Очередь запросов с debounce
         setTimeout(() => {
             GM_xmlhttpRequest({
                 method: "GET",
@@ -59,29 +58,35 @@
                             priceCache[cacheKey] = price;
                             callback(price);
                         } else {
-                            priceCache[cacheKey] = null; // Нет цены (бесплатно или недоступно)
+                            priceCache[cacheKey] = null;
                             callback(null);
                         }
                     } catch (e) {
                         priceCache[cacheKey] = null;
                         callback(null);
                     }
-                }
+                },
+                onerror: () => callback(null)
             });
         }, 100);
     }
 
-    // --- 3. Логика ---
-    function processPriceElement(el) {
-        // Проверяем, не обработали ли мы уже этот блок (или его соседа)
-        if (el.dataset.spProcessed === "1") return;
-        
-        // ВНИМАНИЕ: Если рядом уже есть наш блок (вставленный previously), не дублируем
-        if (el.nextElementSibling && el.nextElementSibling.classList.contains('steam-price-comp-v5')) {
-             el.dataset.spProcessed = "1";
-             return;
-        }
+    // --- 3. Безопасное добавление текста (Метод старого скрипта) ---
+    function appendTextToNode(el, textString) {
+        // Проверяем, не добавлен ли уже текст, чтобы не дублировать
+        if (el.innerText.includes(" | ") || el.innerText.includes("📉") || el.innerText.includes("📈")) return;
 
+        // Мы не создаем div/span, мы создаем текстовый узел.
+        // Для SIH это выглядит как просто продолжение текста цены.
+        const textNode = document.createTextNode(" " + textString);
+        el.appendChild(textNode);
+    }
+
+    // --- 4. Основная логика ---
+    function processPriceElement(el) {
+        // Если уже обработан нашим скриптом
+        if (el.dataset.spTextProcessed === "1") return;
+        
         const rawText = el.innerText || "";
         const text = rawText.toLowerCase();
 
@@ -91,7 +96,7 @@
 
         if (!isKZ && !isRU) return;
 
-        // Чистим цену от мусора других расширений
+        // Чистим цену для парсинга
         const digits = rawText.replace(/\D/g, "");
         if (!digits) return;
         const currentPriceVal = parseInt(digits, 10);
@@ -99,7 +104,8 @@
         const appId = getAppId(el);
         if (!appId) return;
 
-        el.dataset.spProcessed = "1";
+        // Помечаем элемент
+        el.dataset.spTextProcessed = "1";
 
         // Логика RU -> KZ
         if (isRU) {
@@ -108,65 +114,46 @@
 
                 let kzPriceInRub = Math.round(kzPriceInTenge * kztToRub);
                 let diff = 0;
-                let color = "#9ae2a8"; // Green
-                let text = "";
+                let icon = "";
+                let info = "";
 
                 if (currentPriceVal > kzPriceInRub) {
+                     // В KZ дешевле
                      diff = Math.round(((currentPriceVal - kzPriceInRub) / currentPriceVal) * 100);
-                     text = `🇰🇿 ${kzPriceInRub}₽ (-${diff}%)`;
+                     icon = "📉"; // График вниз (цена ниже)
+                     info = `| KZ: ${kzPriceInRub}₽ (-${diff}%) ${icon}`;
                 } else {
+                     // В KZ дороже
                      diff = Math.round(((kzPriceInRub - currentPriceVal) / currentPriceVal) * 100);
-                     color = "#e29a9a"; // Red
-                     text = `🇰🇿 ${kzPriceInRub}₽ (+${diff}%)`;
+                     icon = "📈"; // График вверх (цена выше)
+                     info = `| KZ: ${kzPriceInRub}₽ (+${diff}%) ${icon}`;
                 }
-                insertInfoAfter(el, text, color);
+                
+                appendTextToNode(el, info);
             });
         }
         // Логика KZ -> RU
         else if (isKZ) {
             getRegionalPrice(appId, 'ru', (ruPriceInRub) => {
                 if (!el.isConnected) return;
+                
                 let myTengeInRub = Math.round(currentPriceVal * kztToRub);
-                let text = `≈${myTengeInRub}₽`;
-                let color = "#9ae2a8";
+                let info = `(≈${myTengeInRub}₽)`;
 
                 if (ruPriceInRub) {
                     let diff = 0;
                     if (myTengeInRub > ruPriceInRub) {
                         diff = Math.round(((myTengeInRub - ruPriceInRub) / myTengeInRub) * 100);
-                        text += ` | 🇷🇺 ${ruPriceInRub}₽ (-${diff}%)`;
-                        color = "#e29a9a";
+                        info += ` | RU: ${ruPriceInRub}₽ (-${diff}%) 📉`; // В РФ дешевле
                     } else {
                         diff = Math.round(((ruPriceInRub - myTengeInRub) / myTengeInRub) * 100);
-                        text += ` | 🇷🇺 ${ruPriceInRub}₽ (+${diff}%)`;
+                        info += ` | RU: ${ruPriceInRub}₽ (+${diff}%) 📈`; // В РФ дороже
                     }
                 }
-                insertInfoAfter(el, text, color);
+                
+                appendTextToNode(el, info);
             });
         }
-    }
-
-    // --- 4. Вставка (БЕЗОПАСНАЯ) ---
-    function insertInfoAfter(targetEl, text, color) {
-        // Создаем отдельный блок
-        const div = document.createElement("div");
-        div.className = "steam-price-comp-v5";
-        div.textContent = text;
-        div.style.cssText = `
-            display: block;
-            color: ${color};
-            font-size: 11px;
-            font-weight: bold;
-            font-family: Arial, sans-serif;
-            margin-top: 2px;
-            margin-bottom: 5px;
-            line-height: 1.2;
-            padding-left: 2px;
-        `;
-
-        // Вместо appendChild (внутрь), делаем insertAdjacentElement (после)
-        // Это не ломает структуру внутри кнопки, которую читает другое расширение
-        targetEl.insertAdjacentElement('afterend', div);
     }
 
     // --- 5. Поиск ID ---
@@ -174,13 +161,10 @@
         let m = location.href.match(/app\/(\d+)/);
         if (m) return m[1];
         
-        // Попытка найти в форме, если мы в списке
         const form = el.closest('form');
         if (form) {
             const action = form.getAttribute('action');
             if (action && action.includes('add_to_cart')) {
-                // В списках часто нет appid в чистом виде, API требует appid
-                // Попробуем найти data-ds-appid у родителя
                 const parent = el.closest('[data-ds-appid]');
                 if (parent) return parent.getAttribute('data-ds-appid');
             }
@@ -201,8 +185,7 @@
     function startObserver() {
         const observer = new MutationObserver(() => {
             if (scanTimeout) clearTimeout(scanTimeout);
-            // Увеличенный debounce (800мс), чтобы другие скрипты успели отработать
-            scanTimeout = setTimeout(runScan, 800);
+            scanTimeout = setTimeout(runScan, 1000);
         });
         observer.observe(document.body, { childList: true, subtree: true });
     }
