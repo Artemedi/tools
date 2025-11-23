@@ -1,79 +1,90 @@
 // ==UserScript==
-// @name         Steam KZT → RUB Converter with Lazy Load
+// @name         Steam KZT→RUB Converter (RU Region Add-on)
 // @namespace    http://tampermonkey.net/
-// @version      1.5
-// @description  Steam KZT → RUB, работает с подгружаемым содержимым в ленте (wishlist, каталоги и пр.)
+// @version      2.0
+// @description  Показывает цены Steam KZ в рублях + конвертация KZT→RUB. Работает в обоих регионах.
 // @match        https://store.steampowered.com/*
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @connect      store.steampowered.com
 // ==/UserScript==
 
-(function() {
-  'use strict';
-  const RUB_MARKER = " (~";
-  let KZT_TO_RUB = null;
-  const ACCESS_KEY = "0dd78cddca06c2e4b15e40a4fd15fbc5";
-  const API_URL = `https://api.exchangerate.host/convert?from=KZT&to=RUB&amount=1&access_key=${ACCESS_KEY}`;
+(function () {
+    'use strict';
 
-  function convertTextNode(node) {
-      if (node.nodeValue.includes(RUB_MARKER) || !KZT_TO_RUB) return;
-      const regex = /(\d{1,3}(?:[ \u00A0]\d{3})*(?:[\.,]\d+)?|\d+[\.,]?\d*)\s*₸/g;
-      node.nodeValue = node.nodeValue.replace(regex, (match, number) => {
-          const cleanNum = number.replace(/[\u00A0 ]/g, '').replace(',', '.');
-          const value = parseFloat(cleanNum);
-          if (isNaN(value)) return match;
-          const rub = Math.round(value * KZT_TO_RUB);
-          return `${number}₸ (~${rub}₽)`;
-      });
-  }
+    const RUB_RATE_API = "https://api.exchangerate.host/latest?base=KZT&symbols=RUB";
 
-  function walkAndConvert(node) {
-      if (node.nodeType === Node.TEXT_NODE) {
-          if (node.nodeValue && node.nodeValue.includes("₸")) convertTextNode(node);
-      } else {
-          for (let i = 0; i < node.childNodes.length; i++) {
-              walkAndConvert(node.childNodes[i]);
-          }
-      }
-  }
+    async function getExchangeRate() {
+        try {
+            const response = await fetch(RUB_RATE_API);
+            const data = await response.json();
+            return data.rates.RUB;
+        } catch (e) {
+            console.error("Ошибка получения курса KZT→RUB:", e);
+            return null;
+        }
+    }
 
-  function scan() {
-      walkAndConvert(document.body);
-  }
-
-  fetch(API_URL)
-    .then(r => r.json())
-    .then(data => {
-        KZT_TO_RUB = (
-            data && (typeof data.result === 'number')
-                ? data.result
-                : (data.info && data.info.quote)
-        );
-        if (!KZT_TO_RUB) KZT_TO_RUB = 0.15185;
-
-        scan();
-
-        // MutationObserver — слежение за изменениями
-        const observer = new MutationObserver((mutations) => {
-            mutations.forEach(mutation => {
-                if (mutation.addedNodes && mutation.addedNodes.length) {
-                    mutation.addedNodes.forEach(walkAndConvert);
+    async function getKZPrice(appid) {
+        return new Promise(resolve => {
+            GM_xmlhttpRequest({
+                method: "GET",
+                url: `https://store.steampowered.com/api/appdetails?appids=${appid}&cc=kz&filters=price_overview`,
+                onload: function (response) {
+                    try {
+                        const data = JSON.parse(response.responseText);
+                        if (!data[appid]?.success) return resolve(null);
+                        resolve(data[appid].data.price_overview);
+                    } catch {
+                        resolve(null);
+                    }
                 }
             });
         });
-        observer.observe(document.body, {
-            childList: true,
-            subtree: true,
-            characterData: true
-        });
+    }
 
-        // EXTRA: раз в 2 секунды сканируем всю страницу (на случай, если observer что-то не заметил)
-        setInterval(scan, 2000);
-    })
-    .catch(() => {
-        // fallback на захардкоженный курс
-        KZT_TO_RUB = 0.15185;
-        scan();
-        setInterval(scan, 2000);
-    });
+    function getAppIdFromUrl() {
+        const match = location.pathname.match(/\/app\/(\d+)/);
+        return match ? match[1] : null;
+    }
 
+    function insertConvertedPrice(element, text) {
+        const span = document.createElement("span");
+        span.style.color = "#8fbc8f";
+        span.style.marginLeft = "6px";
+        span.textContent = text;
+        element.appendChild(span);
+    }
+
+    async function main() {
+        const rate = await getExchangeRate();
+        if (!rate) return;
+
+        const priceElement = document.querySelector(".game_purchase_price, .discount_final_price");
+        if (!priceElement) return;
+
+        const appid = getAppIdFromUrl();
+        if (!appid) return;
+
+        const priceText = priceElement.innerText.replace(/\s/g, "");
+
+        // ========= 1. Если регион KZ — обычная конвертация =========
+        if (priceText.includes("₸")) {
+            const kzt = parseInt(priceText);
+            const rub = Math.round(kzt * rate);
+            insertConvertedPrice(priceElement, `(${rub} ₽)`);
+        }
+
+        // ========= 2. Если регион RU — подгружаем настоящую цену KZ =========
+        if (priceText.includes("₽")) {
+            const kzPriceInfo = await getKZPrice(appid);
+            if (!kzPriceInfo) return;
+
+            const kzt = kzPriceInfo.final / 100; // Steam API даёт цену *100
+            const rubKZ = Math.round(kzt * rate);
+
+            insertConvertedPrice(priceElement, `(${rubKZ} ₽ KZ)`);
+        }
+    }
+
+    main();
 })();
