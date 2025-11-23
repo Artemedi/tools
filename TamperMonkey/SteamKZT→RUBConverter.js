@@ -293,4 +293,80 @@
                 if (firstParsed && firstParsed.currency && firstParsed.currency.toUpperCase() === 'RUB') {
                     ruValue = firstParsed.value;
                 } else {
-                    //
+                    // попытаемся найти любой priceEl с RUB
+                    for (const el of priceEls) {
+                        const parsed = parsePriceText(el.innerText || el.textContent || '');
+                        if (parsed && parsed.currency && parsed.currency.toUpperCase() === 'RUB') {
+                            ruValue = parsed.value; break;
+                        }
+                    }
+                }
+
+                // Отрисовываем рядом с каждым прайс-элементом: KZ price в RUB и процент разницы по отношению к ruValue (если ruValue есть)
+                for (const el of priceEls) {
+                    try {
+                        let content = '';
+                        if (kzToRub != null) {
+                            const kzRubRounded = Math.round(kzToRub);
+                            content = `${formatMoney(kzRubRounded, 'RUB')} (${formatMoney(kzAmount, kzCurrency)})`;
+                            if (ruValue != null && ruValue > 0) {
+                                const diff = kzToRub - ruValue;
+                                const pct = (diff / ruValue) * 100;
+                                const sign = (pct >= 0) ? '+' : '';
+                                content += ` <span style="color:${pct>0?'#e74c3c':'#2ecc71'}">(${sign}${pct.toFixed(1)}%)</span>`;
+                            }
+                        } else {
+                            content = `(KZ: ${formatMoney(kzAmount, kzCurrency)} → ? RUB)`;
+                        }
+                        attachBadgeToElement(el, content);
+                    } catch (e) {
+                        log('render error', e);
+                    }
+                }
+                return;
+            } else {
+                log('No idObj or no API attempt');
+            }
+
+        } catch (e) {
+            console.error('SteamPriceCmp error', e);
+        }
+    }
+
+    /*******************************
+     * Реакция на навигацию и динамическую загрузку
+     *******************************/
+    let lastUrl = location.href;
+    function onUrlChange() {
+        if (location.href === lastUrl) return;
+        lastUrl = location.href;
+        setTimeout(() => processPricesOnce(0), PRICE_CHECK_DELAY_MS);
+    }
+
+    // observe history changes (single page app navigation)
+    (function () {
+        const pushState = history.pushState;
+        history.pushState = function () {
+            pushState.apply(this, arguments);
+            window.dispatchEvent(new Event('locationchange'));
+        };
+        const replaceState = history.replaceState;
+        history.replaceState = function () {
+            replaceState.apply(this, arguments);
+            window.dispatchEvent(new Event('locationchange'));
+        };
+        window.addEventListener('popstate', () => { window.dispatchEvent(new Event('locationchange')); });
+        window.addEventListener('locationchange', onUrlChange);
+    })();
+
+    // MutationObserver — повторная попытка при изменении контента страницы
+    const observer = new MutationObserver((mutations) => {
+        // очень грубо — перезапустить обработку при изменении DOM
+        processPricesOnce(0).catch(e => log(e));
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // Первичная попытка с задержкой (чтобы контент успел прогрузиться)
+    setTimeout(() => processPricesOnce(0), PRICE_CHECK_DELAY_MS);
+
+})();
